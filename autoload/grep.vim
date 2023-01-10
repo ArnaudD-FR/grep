@@ -352,6 +352,16 @@ endfunc
 let s:grep_cmd_job = 0
 let s:grep_tempfile = ''
 
+" jobstop()
+" Stop a job indepently of vim and neovim
+func! s:jobstop(job_id)
+	if has('nvim')
+		call jobstop(a:job_id)
+	else
+		call job_stop(a:job_id)
+	end
+endfunc
+
 " deleteTempFile()
 " Delete the temporary file created on MS-Windows to run the grep command
 func! s:deleteTempFile() abort
@@ -364,21 +374,15 @@ func! s:deleteTempFile() abort
     endif
 endfunc
 
-" grep#cmd_output_cb()
+" grep#cmd_on_output()
 " Add output (single line) from a grep command to the quickfix list
-func! grep#cmd_output_cb(qf_id, channel, msg) abort
-    let job = ch_getjob(a:channel)
-    if job_status(job) == 'fail'
-	call s:warnMsg('Error: Job not found in grep command output callback')
-	return
-    endif
-
+func! grep#cmd_on_output(qf_id, job_id, msg) abort
     " Check whether the quickfix list is still present
     if s:Grep_Use_QfID
 	let l = getqflist({'id' : a:qf_id})
 	if !has_key(l, 'id') || l.id == 0
 	    " Quickfix list is not present. Stop the search.
-	    call job_stop(job)
+		call s:jobstop(a:job_id)
 	    return
 	endif
 
@@ -393,16 +397,33 @@ func! grep#cmd_output_cb(qf_id, channel, msg) abort
     endif
 endfunc
 
-" grep#chan_close_cb
-" Close callback for the grep command channel. No more grep output is
-" available.
-func! grep#chan_close_cb(qf_id, channel) abort
+" grep#cmd_output_cb()
+" Retrieve output from vim job
+func! grep#cmd_output_cb(qf_id, channel, msg) abort
     let job = ch_getjob(a:channel)
     if job_status(job) == 'fail'
-	call s:warnMsg('Error: Job not found in grep channel close callback')
+	call s:warnMsg('Error: Job not found in grep command output callback')
 	return
     endif
-    let emsg = '[Search command exited with status ' . job_info(job).exitval . ']'
+
+	call grep#cmd_on_output(a:qf_id, job, a:msg)
+endfunc
+
+" grep#nvim_on_output()
+" Retrieve output from neovim job
+func! grep#nvim_on_output(qf_id, job_id, data, event) abort
+	for i in a:data
+		if len(i) > 0
+			call grep#cmd_on_output(a:qf_id, a:job_id, i)
+		end
+	endfor
+endfunc
+
+" grep#on_close_cb()
+" Close callback for the grep command channel. No more grep output is
+" available.
+func! grep#on_close_cb(qf_id, status) abort
+    let emsg = '[Search command exited with status ' . a:status . ']'
 
     " Check whether the quickfix list is still present
     if s:Grep_Use_QfID
@@ -417,6 +438,18 @@ func! grep#chan_close_cb(qf_id, channel) abort
     endif
 endfunc
 
+" grep#chan_close_cb
+" Close callback for the grep command channel. No more grep output is
+" available.
+func! grep#chan_close_cb(qf_id, channel) abort
+    let job = ch_getjob(a:channel)
+    if job_status(job) == 'fail'
+	call s:warnMsg('Error: Job not found in grep channel close callback')
+	return
+    endif
+	grep#on_close_cb(a:qf_id, job_info(job).exitval)
+endfunc
+
 " grep#cmd_exit_cb()
 " grep command exit handler
 func! grep#cmd_exit_cb(qf_id, job, exit_status) abort
@@ -428,12 +461,19 @@ func! grep#cmd_exit_cb(qf_id, job, exit_status) abort
     endif
 endfunc
 
+" grep#cmd_exit_cb()
+" grep neovim command exit handler
+func! grep#nvim_on_exit(qf_id, job, exit_status, event) abort
+	call grep#cmd_exit_cb(a:qf_id, a:job, a:exit_status)
+	call grep#on_close_cb(a:qf_id, a:exit_status)
+endfunc
+
 " runGrepCmdAsync()
 " Run the grep command asynchronously
 func! s:runGrepCmdAsync(cmd, pattern, action) abort
     if s:grep_cmd_job isnot 0
 	" If the job is already running for some other search, stop it.
-	call job_stop(s:grep_cmd_job)
+	call s:jobstop(s:grep_cmd_job)
 	caddexpr '[Search command interrupted]'
     endif
 
@@ -458,14 +498,26 @@ func! s:runGrepCmdAsync(cmd, pattern, action) abort
 	let cmd_list = [a:cmd]
     else
 	let cmd_list = [&shell, &shellcmdflag, a:cmd]
-    endif
+	endif
+	if has('nvim')
+    let s:grep_cmd_job = jobstart(cmd_list,
+		\ {'on_stdout' : function('grep#nvim_on_output', [qf_id]),
+		\ 'on_exit' : function('grep#nvim_on_exit', [qf_id]) })
+	if s:grep_cmd_job > 0
+	let s:grep_cmd_job_status = 'run'
+	else
+	let s:grep_cmd_job_status = 'fail'
+	end
+	else
     let s:grep_cmd_job = job_start(cmd_list,
 		\ {'callback' : function('grep#cmd_output_cb', [qf_id]),
 		\ 'close_cb' : function('grep#chan_close_cb', [qf_id]),
 		\ 'exit_cb' : function('grep#cmd_exit_cb', [qf_id]),
 		\ 'in_io' : 'null'})
+	let s:grep_cmd_job_status = job_status(s:grep_cmd_job)
+	endif
 
-    if job_status(s:grep_cmd_job) == 'fail'
+    if s:grep_cmd_job_status == 'fail'
 	let s:grep_cmd_job = 0
 	call s:warnMsg('Error: Failed to start the grep command')
 	call s:deleteTempFile()
